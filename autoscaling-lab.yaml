@@ -1,0 +1,661 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Auto Scaling Lab - Alphonse Shema
+  Highly available, auto-scaling web tier using EC2 Auto Scaling and ALB.
+  Private EC2 instances behind a public ALB. Regional NAT Gateway for outbound
+  internet access. CPU-based scaling policies. GitSync enabled.
+
+
+# =============================================================================
+# PARAMETERS
+# =============================================================================
+
+Parameters:
+
+  EnvironmentName:
+    Type: String
+    Default: autoscaling-lab
+    Description: Prefix for all resource names and tags
+
+  VpcCIDR:
+    Type: String
+    Default: 10.0.0.0/16
+    Description: CIDR block for the VPC
+
+  PublicSubnet1CIDR:
+    Type: String
+    Default: 10.0.1.0/24
+    Description: Public Subnet AZ1 - for ALB
+
+  PublicSubnet2CIDR:
+    Type: String
+    Default: 10.0.2.0/24
+    Description: Public Subnet AZ2 - for ALB
+
+  PrivateSubnet1CIDR:
+    Type: String
+    Default: 10.0.3.0/24
+    Description: Private Subnet AZ1 - for EC2 instances
+
+  PrivateSubnet2CIDR:
+    Type: String
+    Default: 10.0.4.0/24
+    Description: Private Subnet AZ2 - for EC2 instances
+
+  InstanceType:
+    Type: String
+    Default: t3.micro
+    AllowedValues: [t3.micro, t3.small, t3.medium]
+    Description: EC2 instance type
+
+  # Auto-resolves to latest Amazon Linux 2023 AMI per region
+  LatestAmiId:
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: /aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64
+
+  # ASG capacity settings
+  AsgMinSize:
+    Type: Number
+    Default: 1
+    Description: Minimum number of instances
+
+  AsgDesiredSize:
+    Type: Number
+    Default: 1
+    Description: Desired number of instances at launch
+
+  AsgMaxSize:
+    Type: Number
+    Default: 4
+    Description: Maximum number of instances
+
+  # CPU threshold that triggers scale-out
+  CpuScaleOutThreshold:
+    Type: Number
+    Default: 30
+    Description: CPU % that triggers adding a new instance
+
+
+# =============================================================================
+# RESOURCES
+# =============================================================================
+
+Resources:
+
+  # ---------------------------------------------------------------------------
+  # 1. VPC
+  # The private network that contains everything.
+  # DNS must be enabled for SSM and package downloads to work.
+  # ---------------------------------------------------------------------------
+
+  VPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: !Ref VpcCIDR
+      EnableDnsHostnames: true
+      EnableDnsSupport: true
+      Tags:
+        - Key: Name
+          Value: !Sub ${EnvironmentName}-vpc
+
+  # ---------------------------------------------------------------------------
+  # 2. INTERNET GATEWAY
+  # The door between the VPC and the public internet.
+  # Required for ALB to receive traffic and NAT Gateway to forward it.
+  # Two steps: create the IGW, then attach it to the VPC.
+  # ---------------------------------------------------------------------------
+
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags:
+        - Key: Name
+          Value: !Sub ${EnvironmentName}-igw
+
+  InternetGatewayAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref VPC
+      InternetGatewayId: !Ref InternetGateway
+
+  # ---------------------------------------------------------------------------
+  # 3. SUBNETS
+  # Two public subnets for the ALB (must be in different AZs).
+  # Two private subnets for EC2 instances (no public IPs).
+  # ALB requires at least two public subnets in different AZs.
+  # ---------------------------------------------------------------------------
+
+  PublicSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: !Ref PublicSubnet1CIDR
+      AvailabilityZone: !Select [0, !GetAZs '']
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: !Sub ${EnvironmentName}-public-subnet-az1
+        - Key: Tier
+          Value: Public
+
+  PublicSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: !Ref PublicSubnet2CIDR
+      AvailabilityZone: !Select [1, !GetAZs '']
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: !Sub ${EnvironmentName}-public-subnet-az2
+        - Key: Tier
+          Value: Public
+
+  PrivateSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: !Ref PrivateSubnet1CIDR
+      AvailabilityZone: !Select [0, !GetAZs '']
+      MapPublicIpOnLaunch: false
+      Tags:
+        - Key: Name
+          Value: !Sub ${EnvironmentName}-private-subnet-az1
+        - Key: Tier
+          Value: Private
+
+  PrivateSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: !Ref PrivateSubnet2CIDR
+      AvailabilityZone: !Select [1, !GetAZs '']
+      MapPublicIpOnLaunch: false
+      Tags:
+        - Key: Name
+          Value: !Sub ${EnvironmentName}-private-subnet-az2
+        - Key: Tier
+          Value: Private
+
+  # ---------------------------------------------------------------------------
+  # 4. ELASTIC IP + REGIONAL NAT GATEWAY
+  # Lab requirement: ONE Regional NAT Gateway (not two AZ-scoped ones).
+  # A Regional NAT Gateway is placed in ONE public subnet but AWS manages
+  # AZ failover automatically. Private instances use it for outbound internet.
+  # Needed for: yum updates, stress tool installation.
+  # ---------------------------------------------------------------------------
+
+  NatGatewayEIP:
+    Type: AWS::EC2::EIP
+    DependsOn: InternetGatewayAttachment
+    Properties:
+      Domain: vpc
+      Tags:
+        - Key: Name
+          Value: !Sub ${EnvironmentName}-nat-eip
+
+  # Regional NAT Gateway - placed in PublicSubnet1
+  # AWS manages availability across AZs automatically
+  NatGateway:
+    Type: AWS::EC2::NatGateway
+    Properties:
+      AllocationId: !GetAtt NatGatewayEIP.AllocationId
+      SubnetId: !Ref PublicSubnet1
+      Tags:
+        - Key: Name
+          Value: !Sub ${EnvironmentName}-nat-regional
+
+  # ---------------------------------------------------------------------------
+  # 5. ROUTE TABLES
+  # Public route table: both public subnets -> IGW
+  # Private route table: BOTH private subnets -> single NAT Gateway
+  # (This is the Regional NAT design - one NAT for both private subnets)
+  # ---------------------------------------------------------------------------
+
+  # Public Route Table
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: !Sub ${EnvironmentName}-public-rt
+
+  PublicRoute:
+    Type: AWS::EC2::Route
+    DependsOn: InternetGatewayAttachment
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+
+  PublicSubnet1RTA:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnet1
+      RouteTableId: !Ref PublicRouteTable
+
+  PublicSubnet2RTA:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnet2
+      RouteTableId: !Ref PublicRouteTable
+
+  # Private Route Table - SINGLE table for both private subnets
+  # Both point to the same Regional NAT Gateway
+  PrivateRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: !Sub ${EnvironmentName}-private-rt
+
+  PrivateRoute:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref PrivateRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      NatGatewayId: !Ref NatGateway
+
+  PrivateSubnet1RTA:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PrivateSubnet1
+      RouteTableId: !Ref PrivateRouteTable
+
+  PrivateSubnet2RTA:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PrivateSubnet2
+      RouteTableId: !Ref PrivateRouteTable
+
+  # ---------------------------------------------------------------------------
+  # 6. SECURITY GROUPS
+  # ALB Security Group: accepts HTTP from internet
+  # EC2 Security Group: accepts HTTP only from ALB (not from internet directly)
+  # No SSH anywhere - use Session Manager
+  # ---------------------------------------------------------------------------
+
+  # ALB Security Group - faces the internet
+  ALBSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: !Sub ${EnvironmentName}-alb-sg
+      GroupDescription: Allow HTTP from internet to ALB
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+          Description: HTTP from internet
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          CidrIp: 0.0.0.0/0
+          Description: All outbound
+      Tags:
+        - Key: Name
+          Value: !Sub ${EnvironmentName}-alb-sg
+
+  # EC2 Instance Security Group - only accepts traffic from ALB
+  # This enforces that no one can reach instances directly
+  EC2SecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: !Sub ${EnvironmentName}-ec2-sg
+      GroupDescription: Allow HTTP from ALB only - no direct internet access
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        # Only allow HTTP from the ALB security group - not from the internet
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          SourceSecurityGroupId: !Ref ALBSecurityGroup
+          Description: HTTP from ALB only
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          CidrIp: 0.0.0.0/0
+          Description: All outbound via NAT Gateway
+      Tags:
+        - Key: Name
+          Value: !Sub ${EnvironmentName}-ec2-sg
+
+  # ---------------------------------------------------------------------------
+  # 7. IAM ROLE FOR SSM SESSION MANAGER
+  # Allows connecting to private instances without SSH.
+  # AmazonSSMManagedInstanceCore is all that is needed.
+  # ---------------------------------------------------------------------------
+
+  EC2SSMRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub ${EnvironmentName}-ec2-ssm-role
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+      Tags:
+        - Key: Name
+          Value: !Sub ${EnvironmentName}-ssm-role
+
+  EC2InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      InstanceProfileName: !Sub ${EnvironmentName}-instance-profile
+      Roles:
+        - !Ref EC2SSMRole
+
+  # ---------------------------------------------------------------------------
+  # 8. APPLICATION LOAD BALANCER
+  # Internet-facing ALB in both public subnets.
+  # Distributes traffic across all healthy instances using round-robin.
+  # Single public DNS endpoint for users.
+  # ---------------------------------------------------------------------------
+
+  ApplicationLoadBalancer:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Name: !Sub ${EnvironmentName}-alb
+      Scheme: internet-facing
+      Type: application
+      # ALB must be in public subnets to receive internet traffic
+      Subnets:
+        - !Ref PublicSubnet1
+        - !Ref PublicSubnet2
+      SecurityGroups:
+        - !Ref ALBSecurityGroup
+      Tags:
+        - Key: Name
+          Value: !Sub ${EnvironmentName}-alb
+
+  # ---------------------------------------------------------------------------
+  # 9. TARGET GROUP
+  # The ALB forwards traffic to this target group.
+  # The ASG automatically registers new instances here.
+  # Health checks determine which instances receive traffic.
+  # ---------------------------------------------------------------------------
+
+  ALBTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: !Sub ${EnvironmentName}-tg
+      Port: 80
+      Protocol: HTTP
+      VpcId: !Ref VPC
+      TargetType: instance
+      # Health check settings
+      # ALB calls GET / on port 80 every 30 seconds
+      # Instance marked healthy after 2 successes, unhealthy after 2 failures
+      HealthCheckProtocol: HTTP
+      HealthCheckPort: '80'
+      HealthCheckPath: /
+      HealthCheckIntervalSeconds: 30
+      HealthCheckTimeoutSeconds: 5
+      HealthyThresholdCount: 2
+      UnhealthyThresholdCount: 2
+      Tags:
+        - Key: Name
+          Value: !Sub ${EnvironmentName}-tg
+
+  # ---------------------------------------------------------------------------
+  # 10. ALB LISTENER
+  # Listens on port 80 and forwards all traffic to the target group.
+  # This is what connects the ALB to the target group.
+  # ---------------------------------------------------------------------------
+
+  ALBListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref ApplicationLoadBalancer
+      Port: 80
+      Protocol: HTTP
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref ALBTargetGroup
+
+  # ---------------------------------------------------------------------------
+  # 11. LAUNCH TEMPLATE
+  # The blueprint for every EC2 instance the ASG creates.
+  # Defines AMI, instance type, security group, IAM profile, and UserData.
+  # UserData installs Apache and creates a webpage showing instance ID and IP.
+  # This is how stakeholders verify different instances are serving traffic.
+  # ---------------------------------------------------------------------------
+
+  LaunchTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    Properties:
+      LaunchTemplateName: !Sub ${EnvironmentName}-launch-template
+      LaunchTemplateData:
+        ImageId: !Ref LatestAmiId
+        InstanceType: !Ref InstanceType
+        IamInstanceProfile:
+          Arn: !GetAtt EC2InstanceProfile.Arn
+        SecurityGroupIds:
+          - !Ref EC2SecurityGroup
+        # No key pair - SSH is not allowed, use Session Manager
+        # UserData: installs Apache, creates webpage, installs stress tool
+        # The webpage shows instance ID and private IP so you can see
+        # which instance is serving each request during the demo
+        UserData:
+          Fn::Base64: !Sub |
+            #!/bin/bash
+            yum update -y
+            yum install -y httpd stress
+            systemctl start httpd
+            systemctl enable httpd
+
+            # Get instance metadata
+            INSTANCE_ID=$(curl -s http://169.254.169.254/latest/meta-data/instance-id)
+            PRIVATE_IP=$(curl -s http://169.254.169.254/latest/meta-data/local-ipv4)
+            AZ=$(curl -s http://169.254.169.254/latest/meta-data/placement/availability-zone)
+
+            # Create the webpage - shows instance-specific info for demo
+            cat > /var/www/html/index.html <<EOF
+            <!DOCTYPE html>
+            <html>
+            <head>
+              <title>Auto Scaling Lab</title>
+              <style>
+                * { margin: 0; padding: 0; box-sizing: border-box; }
+                body { font-family: Arial, sans-serif; background: #EBF5FB;
+                       display: flex; justify-content: center; align-items: center;
+                       min-height: 100vh; }
+                .card { background: white; border-radius: 16px; padding: 48px;
+                        max-width: 680px; width: 90%;
+                        box-shadow: 0 8px 24px rgba(0,0,0,0.12); }
+                h1 { color: #1F3864; margin-bottom: 8px; }
+                .subtitle { color: #888; margin-bottom: 32px; font-size: 0.9em; }
+                .info-row { display: flex; justify-content: space-between;
+                            padding: 12px 0; border-bottom: 1px solid #f0f0f0; }
+                .label { color: #555; font-weight: bold; }
+                .value { color: #1F3864; font-family: monospace; font-size: 0.95em; }
+                .badges { margin-top: 24px; }
+                .badge { display: inline-block; padding: 6px 16px;
+                         border-radius: 20px; margin: 4px;
+                         font-size: 0.82em; font-weight: bold; }
+                .blue { background: #2E75B6; color: white; }
+                .green { background: #1E6B3C; color: white; }
+                .orange { background: #C55A11; color: white; }
+                .stress-box { margin-top: 28px; padding: 16px;
+                              background: #FFF3CD; border-radius: 8px;
+                              border-left: 4px solid #FFC107; }
+                .stress-box h3 { color: #856404; margin-bottom: 8px; }
+                .stress-box code { background: #333; color: #fff;
+                                   padding: 4px 8px; border-radius: 4px;
+                                   font-size: 0.85em; display: block;
+                                   margin-top: 6px; }
+              </style>
+            </head>
+            <body>
+              <div class="card">
+                <h1>Auto Scaling Lab</h1>
+                <p class="subtitle">Alphonse Shema - Highly Available Web Tier</p>
+
+                <div class="info-row">
+                  <span class="label">Instance ID</span>
+                  <span class="value">$INSTANCE_ID</span>
+                </div>
+                <div class="info-row">
+                  <span class="label">Private IP</span>
+                  <span class="value">$PRIVATE_IP</span>
+                </div>
+                <div class="info-row">
+                  <span class="label">Availability Zone</span>
+                  <span class="value">$AZ</span>
+                </div>
+                <div class="info-row">
+                  <span class="label">Region</span>
+                  <span class="value">${AWS::Region}</span>
+                </div>
+                <div class="info-row">
+                  <span class="label">Stack</span>
+                  <span class="value">${AWS::StackName}</span>
+                </div>
+
+                <div class="badges">
+                  <span class="badge blue">Behind ALB</span>
+                  <span class="badge green">Private Subnet</span>
+                  <span class="badge orange">Auto Scaling Group</span>
+                </div>
+
+                <div class="stress-box">
+                  <h3>CPU Stress Test Command</h3>
+                  <p>Run this from Session Manager to trigger scale-out:</p>
+                  <code>stress --cpu 4 --timeout 300</code>
+                  <p style="margin-top:8px;font-size:0.85em;color:#856404;">
+                    This runs for 5 minutes. Watch EC2 Auto Scaling add instances when CPU exceeds ${CpuScaleOutThreshold}%.
+                  </p>
+                </div>
+              </div>
+            </body>
+            </html>
+            EOF
+        TagSpecifications:
+          - ResourceType: instance
+            Tags:
+              - Key: Name
+                Value: !Sub ${EnvironmentName}-instance
+              - Key: Project
+                Value: !Ref EnvironmentName
+
+  # ---------------------------------------------------------------------------
+  # 12. AUTO SCALING GROUP
+  # Creates and manages EC2 instances using the Launch Template.
+  # Min 1, Desired 1, Max 4.
+  # Instances launch in private subnets.
+  # Automatically registers new instances with the ALB Target Group.
+  # ---------------------------------------------------------------------------
+
+  AutoScalingGroup:
+    Type: AWS::AutoScaling::AutoScalingGroup
+    DependsOn: NatGateway
+    Properties:
+      AutoScalingGroupName: !Sub ${EnvironmentName}-asg
+      # Use the Launch Template defined above
+      LaunchTemplate:
+        LaunchTemplateId: !Ref LaunchTemplate
+        Version: !GetAtt LaunchTemplate.LatestVersionNumber
+      MinSize: !Ref AsgMinSize
+      DesiredCapacity: !Ref AsgDesiredSize
+      MaxSize: !Ref AsgMaxSize
+      # Launch instances in private subnets across both AZs
+      VPCZoneIdentifier:
+        - !Ref PrivateSubnet1
+        - !Ref PrivateSubnet2
+      # Automatically register new instances with the ALB target group
+      TargetGroupARNs:
+        - !Ref ALBTargetGroup
+      # Health check type ELB means ASG uses ALB health checks
+      # If ALB marks an instance unhealthy, ASG replaces it
+      HealthCheckType: ELB
+      HealthCheckGracePeriod: 300
+      Tags:
+        - Key: Name
+          Value: !Sub ${EnvironmentName}-instance
+          PropagateAtLaunch: true
+        - Key: Project
+          Value: !Ref EnvironmentName
+          PropagateAtLaunch: true
+
+  # ---------------------------------------------------------------------------
+  # 13. SCALE-OUT POLICY
+  # When CPU exceeds threshold, this policy adds instances.
+  # TargetTrackingScaling is the simplest and most reliable type.
+  # ASG automatically calculates how many instances to add.
+  # ScaleInCooldown: wait 60s before removing instances after scaling in.
+  # ScaleOutCooldown: wait 60s before adding more instances after scaling out.
+  # ---------------------------------------------------------------------------
+
+  ScaleOutPolicy:
+    Type: AWS::AutoScaling::ScalingPolicy
+    Properties:
+      AutoScalingGroupName: !Ref AutoScalingGroup
+      PolicyType: TargetTrackingScaling
+      TargetTrackingConfiguration:
+        # Use the built-in CPU utilization metric
+        PredefinedMetricSpecification:
+          PredefinedMetricType: ASGAverageCPUUtilization
+        # Scale out when average CPU across all instances exceeds this value
+        TargetValue: !Ref CpuScaleOutThreshold
+        # Also scale IN when CPU drops below threshold
+        DisableScaleIn: false
+        ScaleInCooldown: 60
+        ScaleOutCooldown: 60
+
+
+# =============================================================================
+# OUTPUTS
+# =============================================================================
+
+Outputs:
+
+  ALBDNSName:
+    Description: ALB DNS name - use this to access the application
+    Value: !GetAtt ApplicationLoadBalancer.DNSName
+    Export:
+      Name: !Sub ${EnvironmentName}-alb-dns
+
+  ALBUrl:
+    Description: Full URL to access the web application
+    Value: !Sub http://${ApplicationLoadBalancer.DNSName}
+
+  VPCId:
+    Description: VPC ID
+    Value: !Ref VPC
+
+  AutoScalingGroupName:
+    Description: Name of the Auto Scaling Group - use in console to monitor
+    Value: !Ref AutoScalingGroup
+
+  NatGatewayEIP:
+    Description: Elastic IP of the Regional NAT Gateway
+    Value: !Ref NatGatewayEIP
+
+  LaunchTemplateName:
+    Description: Name of the Launch Template
+    Value: !Ref LaunchTemplate
+
+  TargetGroupArn:
+    Description: ARN of the ALB Target Group
+    Value: !Ref ALBTargetGroup
+
+  StressTestNote:
+    Description: How to trigger scale-out during demo
+    Value: >
+      1. Connect to any instance via Session Manager.
+      2. Run: stress --cpu 4 --timeout 300
+      3. Watch EC2 Auto Scaling in the console add instances.
+      4. Refresh the ALB URL to see different instance IDs serving traffic.
+
+  DemoNote:
+    Description: How to verify load balancing during demo
+    Value: >
+      Open the ALB URL in your browser and keep refreshing.
+      The Instance ID and Private IP on the page will change
+      as the ALB routes requests to different instances.
