@@ -358,19 +358,14 @@ Resources:
             systemctl enable httpd
 
             # IMDSv2 - get token first then fetch metadata
-            TOKEN=$(curl -s -X PUT "http://169.254.169.254/latest/api/token" \
-              -H "X-aws-ec2-metadata-token-ttl-seconds: 21600")
+            TOKEN=$(curl -s -X PUT "http://169.254.169.254/latest/api/token" -H "X-aws-ec2-metadata-token-ttl-seconds: 21600")
 
-            INSTANCE_ID=$(curl -s -H "X-aws-ec2-metadata-token: $TOKEN" \
-              http://169.254.169.254/latest/meta-data/instance-id)
+            INSTANCE_ID=$(curl -s -H "X-aws-ec2-metadata-token: $TOKEN" http://169.254.169.254/latest/meta-data/instance-id)
+            PRIVATE_IP=$(curl -s -H "X-aws-ec2-metadata-token: $TOKEN" http://169.254.169.254/latest/meta-data/local-ipv4)
+            AZ=$(curl -s -H "X-aws-ec2-metadata-token: $TOKEN" http://169.254.169.254/latest/meta-data/placement/availability-zone)
 
-            PRIVATE_IP=$(curl -s -H "X-aws-ec2-metadata-token: $TOKEN" \
-              http://169.254.169.254/latest/meta-data/local-ipv4)
-
-            AZ=$(curl -s -H "X-aws-ec2-metadata-token: $TOKEN" \
-              http://169.254.169.254/latest/meta-data/placement/availability-zone)
-
-            cat > /var/www/html/index.html <<EOF
+            # Write HTML with placeholders first - quoted HTMLEOF prevents variable expansion
+            cat > /var/www/html/index.html << 'HTMLEOF'
             <!DOCTYPE html>
             <html>
             <head>
@@ -412,23 +407,23 @@ Resources:
                 <p class="subtitle">Alphonse Shema - Highly Available Web Tier</p>
                 <div class="info-row">
                   <span class="label">Instance ID</span>
-                  <span class="value">$INSTANCE_ID</span>
+                  <span class="value">INSTANCE_ID_PLACEHOLDER</span>
                 </div>
                 <div class="info-row">
                   <span class="label">Private IP</span>
-                  <span class="value">$PRIVATE_IP</span>
+                  <span class="value">PRIVATE_IP_PLACEHOLDER</span>
                 </div>
                 <div class="info-row">
                   <span class="label">Availability Zone</span>
-                  <span class="value">$AZ</span>
+                  <span class="value">AZ_PLACEHOLDER</span>
                 </div>
                 <div class="info-row">
                   <span class="label">Region</span>
-                  <span class="value">${AWS::Region}</span>
+                  <span class="value">REGION_PLACEHOLDER</span>
                 </div>
                 <div class="info-row">
                   <span class="label">Stack</span>
-                  <span class="value">${AWS::StackName}</span>
+                  <span class="value">STACK_PLACEHOLDER</span>
                 </div>
                 <div class="badges">
                   <span class="badge blue">Behind ALB</span>
@@ -440,13 +435,22 @@ Resources:
                   <p>Run this from Session Manager to trigger scale-out:</p>
                   <code>stress --cpu 4 --timeout 300</code>
                   <p style="margin-top:8px;font-size:0.85em;color:#856404;">
-                    This runs for 5 minutes. Watch EC2 Auto Scaling add instances when CPU exceeds ${CpuScaleOutThreshold}%.
+                    This runs for 5 minutes. Watch EC2 Auto Scaling add instances when CPU exceeds CPU_THRESHOLD_PLACEHOLDER%.
                   </p>
                 </div>
               </div>
             </body>
             </html>
-            EOF
+            HTMLEOF
+
+            # Replace placeholders with real values using sed
+            sed -i "s/INSTANCE_ID_PLACEHOLDER/$INSTANCE_ID/g" /var/www/html/index.html
+            sed -i "s/PRIVATE_IP_PLACEHOLDER/$PRIVATE_IP/g" /var/www/html/index.html
+            sed -i "s/AZ_PLACEHOLDER/$AZ/g" /var/www/html/index.html
+            sed -i "s/REGION_PLACEHOLDER/${AWS::Region}/g" /var/www/html/index.html
+            sed -i "s/STACK_PLACEHOLDER/${AWS::StackName}/g" /var/www/html/index.html
+            sed -i "s/CPU_THRESHOLD_PLACEHOLDER/${CpuScaleOutThreshold}/g" /var/www/html/index.html
+
         TagSpecifications:
           - ResourceType: instance
             Tags:
