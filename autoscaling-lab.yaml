@@ -3,7 +3,7 @@ Description: >
   Auto Scaling Lab - Alphonse Shema
   Highly available, auto-scaling web tier using EC2 Auto Scaling and ALB.
   Private EC2 instances behind a public ALB. Regional NAT Gateway for outbound
-  internet access. CPU-based scaling policies. GitSync enabled.
+  internet access. CPU-based target tracking scaling policy. GitSync enabled.
 
 
 Parameters:
@@ -66,12 +66,13 @@ Parameters:
   CpuScaleOutThreshold:
     Type: Number
     Default: 30
-    Description: CPU % that triggers adding a new instance
+    Description: CPU % that triggers scale-out
 
 
 Resources:
 
   # 1. VPC
+
   VPC:
     Type: AWS::EC2::VPC
     Properties:
@@ -83,6 +84,7 @@ Resources:
           Value: !Sub ${EnvironmentName}-vpc
 
   # 2. INTERNET GATEWAY
+
   InternetGateway:
     Type: AWS::EC2::InternetGateway
     Properties:
@@ -96,9 +98,14 @@ Resources:
       VpcId: !Ref VPC
       InternetGatewayId: !Ref InternetGateway
 
+
   # 3. SUBNETS
+  # Public subnets depend on the IGW attachment to ensure
+  # the gateway is fully attached before subnets are created.
+
   PublicSubnet1:
     Type: AWS::EC2::Subnet
+    DependsOn: InternetGatewayAttachment
     Properties:
       VpcId: !Ref VPC
       CidrBlock: !Ref PublicSubnet1CIDR
@@ -112,6 +119,7 @@ Resources:
 
   PublicSubnet2:
     Type: AWS::EC2::Subnet
+    DependsOn: InternetGatewayAttachment
     Properties:
       VpcId: !Ref VPC
       CidrBlock: !Ref PublicSubnet2CIDR
@@ -150,6 +158,9 @@ Resources:
           Value: Private
 
   # 4. ELASTIC IP + REGIONAL NAT GATEWAY
+  # Single NAT Gateway placed in PublicSubnet1. Both private
+  # subnets route outbound traffic through this gateway.
+
   NatGatewayEIP:
     Type: AWS::EC2::EIP
     DependsOn: InternetGatewayAttachment
@@ -164,11 +175,15 @@ Resources:
     Properties:
       AllocationId: !GetAtt NatGatewayEIP.AllocationId
       SubnetId: !Ref PublicSubnet1
+      ConnectivityType: public
       Tags:
         - Key: Name
-          Value: !Sub ${EnvironmentName}-nat-regional
+          Value: !Sub ${EnvironmentName}-nat
+
 
   # 5. ROUTE TABLES
+  # Public subnets share one route table pointing to the IGW.
+
   PublicRouteTable:
     Type: AWS::EC2::RouteTable
     Properties:
@@ -225,6 +240,10 @@ Resources:
       RouteTableId: !Ref PrivateRouteTable
 
   # 6. SECURITY GROUPS
+  # ALB SG: accepts HTTP from the internet.
+  # EC2 SG: accepts HTTP from the ALB only — no direct inbound access.
+  # Outbound rules are omitted; AWS allows all outbound by default.
+
   ALBSecurityGroup:
     Type: AWS::EC2::SecurityGroup
     Properties:
@@ -237,10 +256,6 @@ Resources:
           ToPort: 80
           CidrIp: 0.0.0.0/0
           Description: HTTP from internet
-      SecurityGroupEgress:
-        - IpProtocol: -1
-          CidrIp: 0.0.0.0/0
-          Description: All outbound
       Tags:
         - Key: Name
           Value: !Sub ${EnvironmentName}-alb-sg
@@ -257,16 +272,16 @@ Resources:
           ToPort: 80
           SourceSecurityGroupId: !Ref ALBSecurityGroup
           Description: HTTP from ALB only
-      SecurityGroupEgress:
-        - IpProtocol: -1
-          CidrIp: 0.0.0.0/0
-          Description: All outbound via NAT Gateway
       Tags:
         - Key: Name
           Value: !Sub ${EnvironmentName}-ec2-sg
 
+
   # 7. IAM ROLE FOR SSM SESSION MANAGER
-  # FIX 1: Removed RoleName - DCE accounts block custom IAM names
+  # Allows connecting to instances via Session Manager without SSH.
+  # RoleName and InstanceProfileName are omitted so CloudFormation
+  # generates unique names — required for DCE sandbox accounts.
+
   EC2SSMRole:
     Type: AWS::IAM::Role
     Properties:
@@ -283,14 +298,16 @@ Resources:
         - Key: Name
           Value: !Sub ${EnvironmentName}-ssm-role
 
-  # FIX 1: Removed InstanceProfileName - DCE accounts block custom IAM names
   EC2InstanceProfile:
     Type: AWS::IAM::InstanceProfile
     Properties:
       Roles:
         - !Ref EC2SSMRole
 
+  # ─────────────────────────────────────────────
   # 8. APPLICATION LOAD BALANCER
+  # Internet-facing ALB spread across both public subnets.
+  # ─────────────────────────────────────────────
   ApplicationLoadBalancer:
     Type: AWS::ElasticLoadBalancingV2::LoadBalancer
     Properties:
@@ -306,7 +323,11 @@ Resources:
         - Key: Name
           Value: !Sub ${EnvironmentName}-alb
 
+  # ─────────────────────────────────────────────
   # 9. TARGET GROUP
+  # Health check hits / on port 80. An instance must pass
+  # 2 consecutive checks to be marked healthy.
+  # ─────────────────────────────────────────────
   ALBTargetGroup:
     Type: AWS::ElasticLoadBalancingV2::TargetGroup
     Properties:
@@ -326,7 +347,10 @@ Resources:
         - Key: Name
           Value: !Sub ${EnvironmentName}-tg
 
+  # ─────────────────────────────────────────────
   # 10. ALB LISTENER
+  # Forwards all HTTP traffic on port 80 to the target group.
+  # ─────────────────────────────────────────────
   ALBListener:
     Type: AWS::ElasticLoadBalancingV2::Listener
     Properties:
@@ -337,7 +361,13 @@ Resources:
         - Type: forward
           TargetGroupArn: !Ref ALBTargetGroup
 
+  # ─────────────────────────────────────────────
   # 11. LAUNCH TEMPLATE
+  # Installs Apache and the stress tool on every new instance.
+  # Apache is started and enabled before the HTML page is written
+  # so the service is ready as soon as the file exists.
+  # Instance metadata is fetched using IMDSv2 (token-based).
+  # ─────────────────────────────────────────────
   LaunchTemplate:
     Type: AWS::EC2::LaunchTemplate
     Properties:
@@ -352,19 +382,30 @@ Resources:
         UserData:
           Fn::Base64: !Sub |
             #!/bin/bash
+            set -e
+
+            # Update OS packages and install Apache and stress tool
             yum update -y
             yum install -y httpd stress
-            systemctl start httpd
+
+            # Start Apache and enable it to survive reboots
             systemctl enable httpd
+            systemctl start httpd
 
-            # IMDSv2 - get token first then fetch metadata
-            TOKEN=$(curl -s -X PUT "http://169.254.169.254/latest/api/token" -H "X-aws-ec2-metadata-token-ttl-seconds: 21600")
+            # Fetch instance metadata using IMDSv2 (token-based, required on AL2023)
+            TOKEN=$(curl -s -X PUT "http://169.254.169.254/latest/api/token" \
+              -H "X-aws-ec2-metadata-token-ttl-seconds: 21600")
 
-            INSTANCE_ID=$(curl -s -H "X-aws-ec2-metadata-token: $TOKEN" http://169.254.169.254/latest/meta-data/instance-id)
-            PRIVATE_IP=$(curl -s -H "X-aws-ec2-metadata-token: $TOKEN" http://169.254.169.254/latest/meta-data/local-ipv4)
-            AZ=$(curl -s -H "X-aws-ec2-metadata-token: $TOKEN" http://169.254.169.254/latest/meta-data/placement/availability-zone)
+            INSTANCE_ID=$(curl -s -H "X-aws-ec2-metadata-token: $TOKEN" \
+              http://169.254.169.254/latest/meta-data/instance-id)
+            PRIVATE_IP=$(curl -s -H "X-aws-ec2-metadata-token: $TOKEN" \
+              http://169.254.169.254/latest/meta-data/local-ipv4)
+            AZ=$(curl -s -H "X-aws-ec2-metadata-token: $TOKEN" \
+              http://169.254.169.254/latest/meta-data/placement/availability-zone)
 
-            # Write HTML with placeholders first - quoted HTMLEOF prevents variable expansion
+            # Write the HTML page using placeholders.
+            # The heredoc delimiter is quoted (HTMLEOF) so the shell does not
+            # expand $INSTANCE_ID etc. inside the HTML — sed handles that below.
             cat > /var/www/html/index.html << 'HTMLEOF'
             <!DOCTYPE html>
             <html>
@@ -388,9 +429,9 @@ Resources:
                 .badge { display: inline-block; padding: 6px 16px;
                          border-radius: 20px; margin: 4px;
                          font-size: 0.82em; font-weight: bold; }
-                .blue { background: #2E75B6; color: white; }
+                .blue  { background: #2E75B6; color: white; }
                 .green { background: #1E6B3C; color: white; }
-                .orange { background: #C55A11; color: white; }
+                .orange{ background: #C55A11; color: white; }
                 .stress-box { margin-top: 28px; padding: 16px;
                               background: #FFF3CD; border-radius: 8px;
                               border-left: 4px solid #FFC107; }
@@ -435,7 +476,8 @@ Resources:
                   <p>Run this from Session Manager to trigger scale-out:</p>
                   <code>stress --cpu 4 --timeout 300</code>
                   <p style="margin-top:8px;font-size:0.85em;color:#856404;">
-                    This runs for 5 minutes. Watch EC2 Auto Scaling add instances when CPU exceeds CPU_THRESHOLD_PLACEHOLDER%.
+                    Runs for 5 minutes. Watch Auto Scaling add instances
+                    when CPU exceeds CPU_THRESHOLD_PLACEHOLDER%.
                   </p>
                 </div>
               </div>
@@ -443,12 +485,12 @@ Resources:
             </html>
             HTMLEOF
 
-            # Replace placeholders with real values using sed
-            sed -i "s/INSTANCE_ID_PLACEHOLDER/$INSTANCE_ID/g" /var/www/html/index.html
-            sed -i "s/PRIVATE_IP_PLACEHOLDER/$PRIVATE_IP/g" /var/www/html/index.html
-            sed -i "s/AZ_PLACEHOLDER/$AZ/g" /var/www/html/index.html
-            sed -i "s/REGION_PLACEHOLDER/${AWS::Region}/g" /var/www/html/index.html
-            sed -i "s/STACK_PLACEHOLDER/${AWS::StackName}/g" /var/www/html/index.html
+            # Substitute placeholders with real instance values
+            sed -i "s/INSTANCE_ID_PLACEHOLDER/$INSTANCE_ID/g"   /var/www/html/index.html
+            sed -i "s/PRIVATE_IP_PLACEHOLDER/$PRIVATE_IP/g"     /var/www/html/index.html
+            sed -i "s/AZ_PLACEHOLDER/$AZ/g"                     /var/www/html/index.html
+            sed -i "s/REGION_PLACEHOLDER/${AWS::Region}/g"       /var/www/html/index.html
+            sed -i "s/STACK_PLACEHOLDER/${AWS::StackName}/g"     /var/www/html/index.html
             sed -i "s/CPU_THRESHOLD_PLACEHOLDER/${CpuScaleOutThreshold}/g" /var/www/html/index.html
 
         TagSpecifications:
@@ -459,7 +501,12 @@ Resources:
               - Key: Project
                 Value: !Ref EnvironmentName
 
+
   # 12. AUTO SCALING GROUP
+  # Spans both private subnets across two AZs for high availability.
+  # HealthCheckGracePeriod is set to 600 seconds to allow enough time
+  # for yum update and Apache startup before the ALB begins health checks.
+
   AutoScalingGroup:
     Type: AWS::AutoScaling::AutoScalingGroup
     DependsOn: NatGateway
@@ -467,7 +514,6 @@ Resources:
       AutoScalingGroupName: !Sub ${EnvironmentName}-asg
       LaunchTemplate:
         LaunchTemplateId: !Ref LaunchTemplate
-        # FIX 2: Changed LatestVersionNumber to DefaultVersionNumber
         Version: !GetAtt LaunchTemplate.DefaultVersionNumber
       MinSize: !Ref AsgMinSize
       DesiredCapacity: !Ref AsgDesiredSize
@@ -478,7 +524,7 @@ Resources:
       TargetGroupARNs:
         - !Ref ALBTargetGroup
       HealthCheckType: ELB
-      HealthCheckGracePeriod: 300
+      HealthCheckGracePeriod: 600
       Tags:
         - Key: Name
           Value: !Sub ${EnvironmentName}-instance
@@ -488,10 +534,11 @@ Resources:
           PropagateAtLaunch: true
 
   # 13. SCALING POLICY
-  # FIX 3: Removed ScaleInCooldown and ScaleOutCooldown from inside
-  # TargetTrackingConfiguration - they do not belong there and cause
-  # PropertyValidation failure. Added EstimatedInstanceWarmup instead.
-  ScaleOutPolicy:
+  # Target tracking policy on average CPU utilisation.
+  # AWS automatically scales out when CPU exceeds the threshold
+  # and scales in when load drops — no separate scale-in policy needed.
+
+  CpuTargetTrackingPolicy:
     Type: AWS::AutoScaling::ScalingPolicy
     Properties:
       AutoScalingGroupName: !Ref AutoScalingGroup
@@ -514,37 +561,10 @@ Outputs:
     Description: Full URL to access the web application
     Value: !Sub http://${ApplicationLoadBalancer.DNSName}
 
-  VPCId:
-    Description: VPC ID
-    Value: !Ref VPC
-
-  AutoScalingGroupName:
-    Description: Name of the Auto Scaling Group
-    Value: !Ref AutoScalingGroup
-
-  NatGatewayEIP:
-    Description: Elastic IP of the Regional NAT Gateway
-    Value: !Ref NatGatewayEIP
-
-  LaunchTemplateName:
-    Description: Name of the Launch Template
-    Value: !Ref LaunchTemplate
-
-  TargetGroupArn:
-    Description: ARN of the ALB Target Group
-    Value: !Ref ALBTargetGroup
-
   StressTestNote:
-    Description: How to trigger scale-out during demo
+    Description: How to trigger scale-out
     Value: >
       1. Connect to any instance via Session Manager.
       2. Run: stress --cpu 4 --timeout 300
-      3. Watch EC2 Auto Scaling in the console add instances.
+      3. Watch EC2 Auto Scaling add instances in the console.
       4. Refresh the ALB URL to see different instance IDs serving traffic.
-
-  DemoNote:
-    Description: How to verify load balancing during demo
-    Value: >
-      Open the ALB URL in your browser and keep refreshing.
-      The Instance ID and Private IP on the page will change
-      as the ALB routes requests to different instances.
