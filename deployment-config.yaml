@@ -1,3 +1,20 @@
-template-file-path: autoscaling-lab.yaml
-parameters: {}
-tags: {}
+# template-file-path: autoscaling-lab.yaml
+# parameters: {}
+# tags: {}
+template-file-path: autoscaling.yaml
+sync-type: CFN_STACK_SYNC
+parameters:
+  - parameter-key: ProjectName
+    parameter-value: auto-scaling-lab
+  - parameter-key: GitHubOrg
+    parameter-value: alpShema
+  - parameter-key: GitHubAppRepo
+    parameter-value: ecs-lab-app
+  - parameter-key: GitHubInfraRepo
+    parameter-value: auto-scaling
+  - parameter-key: GitHubBranch
+    parameter-value: main
+  - parameter-key: ContainerPort
+    parameter-value: "8080"
+  - parameter-key: HealthCheckPath
+    parameter-value: /actuator/health
